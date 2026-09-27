@@ -2469,8 +2469,11 @@ def _rotate_worker_log(
 
 def _module_hermes_argv() -> list[str]:
     """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
-    console-script target — there is no top-level ``hermes`` package)."""
-    return [sys.executable, "-m", "hermes_cli.main"]
+    console-script target — there is no top-level ``hermes`` package) that
+    still imports from the worker's workspace cwd under PM's store Python."""
+    from hermes_cli._launchers import self_command
+
+    return self_command()
 
 
 def _absolute_hermes_path(path: str) -> str:
@@ -2536,8 +2539,9 @@ def _resolve_hermes_argv() -> list[str]:
     (path-like -> absolute; bare names keep PATH semantics, never a
     same-directory file), then the running interpreter's ``sys.executable -m
     hermes_cli.main`` (exactly this install; also covers shim-less cron,
-    systemd ``User=``, launchd), then ``which("hermes")`` (Windows: safe PATH
-    search, batch shims fall back to the module form) only when ``hermes_cli``
+    systemd ``User=``, launchd; the launcher bootstrap under PM's store
+    Python), then ``which("hermes")`` (Windows: safe PATH search, batch
+    shims fall back to the module form) only when ``hermes_cli``
     is not importable. The module argv must win over PATH: a PATH-first lookup
     lets an attacker-planted ``hermes`` shadow the running install (#111569).
     Mirrors ``gateway.run._resolve_hermes_bin``; local because ``hermes_cli``

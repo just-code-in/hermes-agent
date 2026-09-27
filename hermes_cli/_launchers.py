@@ -20,7 +20,7 @@ from pathlib import Path
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from pm.environments import store_root
+from pm.environments import running_on_store_python, store_root
 
 
 def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main",
@@ -48,6 +48,20 @@ def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main"
         + entry
     )
     return [str(python), "-I", "-c", bootstrap, *args]
+
+
+def self_command(args=(), *, module: str = "hermes_cli.main") -> list[str]:
+    """Argv that re-runs THIS installation as a child, from any working directory.
+
+    ``sys.executable -m <module>`` only works when the interpreter finds the checkout by itself.
+    PM's store Python never does: the launcher inserts the checkout into ``sys.path`` in-process,
+    so a child started from a Kanban workspace dies with ``No module named 'hermes_cli'``. Under
+    store Python, reuse the launcher's own bootstrap; every other interpreter keeps the module form.
+    """
+    root = Path(__file__).resolve().parents[1]
+    if running_on_store_python(root):
+        return runtime_command(root, args, module=module)
+    return [sys.executable, "-m", module, *args]
 
 
 def print_runtime_command(repo_root: Path, argv: list[str]) -> None:

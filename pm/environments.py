@@ -283,12 +283,17 @@ def _require_own_dependencies(project_root: Path) -> None:
     PM's store Python boots with none, so for it there is nothing to keep: refuse instead of
     running on whatever PYTHONPATH it inherited (historically the pre-PM in-tree venv).
     """
+    if running_on_store_python(project_root):
+        raise RuntimeError("no dependency environment is committed for this install")
+
+
+def running_on_store_python(project_root: Path) -> bool:
+    """True for PM's store Python itself. A venv built on it (developer .venv, test env) carries its
+    own packages; the bare store interpreter finds neither packages nor the checkout on its own."""
     import sys
 
-    if sys.prefix != sys.base_prefix:
-        return  # a venv interpreter (developer .venv, test env) carries its own packages
-    if Path(sys.base_prefix).resolve().is_relative_to(store_root(project_root).resolve()):
-        raise RuntimeError("no dependency environment is committed for this install")
+    return (sys.prefix == sys.base_prefix
+            and Path(sys.base_prefix).resolve().is_relative_to(store_root(project_root).resolve()))
 
 
 def activate_dependencies(project_root: Path) -> None:
