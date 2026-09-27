@@ -376,6 +376,17 @@ class TestAppMentionHandler:
             assert slash_matcher.match(
                 expected
             ), f"Slack slash regex does not match {expected}"
+        # The manifest is capped at Slack's 25 commands, but an older app may still declare any
+        # command natively: every name reachable as `/hermes <name>` must also be answered as
+        # `/<name>`, or Slack's delivery goes unanswered (#124762).
+        from hermes_cli.commands_platforms import _SLACK_RESERVED_COMMANDS, slack_subcommand_map
+
+        unanswered = sorted(
+            name for name in slack_subcommand_map()
+            if _re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,31}", name)
+            and name not in _SLACK_RESERVED_COMMANDS
+            and not slash_matcher.match(f"/{name}"))
+        assert not unanswered, f"native slashes the handler would drop: {unanswered}"
 
         # Catch-all generic matcher must be registered after the named handlers
         # so it does not shadow them. It fires for any event type not already

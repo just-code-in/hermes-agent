@@ -30,7 +30,7 @@ the steps below.
 ## Step 1: Create a Slack App
 
 The fastest path is to paste a manifest Hermes generates for you. It
-declares every built-in slash command (`/btw`, `/stop`, `/model`, …),
+declares the core slash commands (`/stop`, `/model`, `/approve`, …),
 every required OAuth scope, every event subscription, and enables Socket
 Mode — all at once.
 
@@ -253,16 +253,21 @@ The bot will **not** automatically join channels. You must invite it to each cha
 
 ## Slash Commands
 
-Every Hermes command (`/btw`, `/stop`, `/new`, `/model`, `/help`, ...)
-is a native Slack slash command — exactly the way they work on Telegram
-and Discord. Type `/` in Slack and the autocomplete picker lists every
-Hermes command with its description.
+Slack allows an app at most 25 slash commands, so the generated manifest
+(see Step 1, Option A) declares `/hermes` plus the 24 commands you are most
+likely to reach for mid-session: `/new`, `/stop`, `/retry`, `/undo`,
+`/rollback`, `/approve`, `/deny`, `/steer`, `/queue`, `/bg`, `/goal`,
+`/plan`, `/model`, `/reasoning`, `/compress`, `/context`, `/usage`,
+`/resume`, `/sessions`, `/kanban`, `/restart`, `/reload-mcp`,
+`/reload-skills` and `/help`. Type `/` in Slack and the autocomplete picker
+lists them with their descriptions.
 
-Under the hood: Hermes ships with a generated Slack app manifest (see
-Step 1, Option A) that declares every command in
-[`COMMAND_REGISTRY`](https://github.com/NousResearch/hermes-agent/blob/main/hermes_cli/commands.py)
-as a slash command. In Socket Mode, Slack routes the command event
-through the WebSocket regardless of the manifest's `url` field.
+Every other Hermes command, including plugin commands, works as
+`/hermes <command> [args]` — for example `/hermes btw what changed?` or
+`/hermes version`. An app created before Slack's 25-command limit keeps its
+older, longer command list, and Hermes still answers every command on it.
+In Socket Mode, Slack routes the command event through the WebSocket
+regardless of the manifest's `url` field.
 
 ### Agent messaging experience
 

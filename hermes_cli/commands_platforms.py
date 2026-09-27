@@ -364,25 +364,27 @@ def discord_skill_commands_by_category(
 
 # --- Slack native slash commands --------------------------------------------
 
-# Slack slash names: lowercase a-z, 0-9, hyphens, underscores, max 32 chars; an app manifest
-# accepts up to 50 slash commands. Reserved = Slack built-ins apps cannot register
+# Slack slash names: lowercase a-z, 0-9, hyphens, underscores, max 32 chars. Slack now caps an app
+# at 25 slash commands ("Too many commands. Each app can have up to 25 commands"); apps created
+# under the old 50 keep their grandfathered commands, and Slack still delivers them. Reserved =
+# Slack built-ins apps cannot register
 # (https://slack.com/help/articles/201259356-Use-built-in-slash-commands).
-_SLACK_MAX_SLASH_COMMANDS = 50
+_SLACK_MAX_SLASH_COMMANDS = 25
 _SLACK_NAME_LIMIT = 32
 _SLACK_INVALID_CHARS = re.compile(r"[^a-z0-9_\-]")
 _SLACK_RESERVED_COMMANDS = frozenset({
     "me", "status", "away", "dnd", "shrug", "remind", "msg", "feed", "who", "collapse", "expand",
     "leave", "join", "open", "search", "topic", "mute", "pro", "shortcuts"})
 
-# Canonical commands deliberately routed through ``/hermes <command>`` on Slack only: the registry
-# sits at Slack's 50-slash cap, so rather than let the clamp silently drop whichever command sorts
-# last (breaking the Telegram-parity test), low-frequency ones are demoted here. Rule: when a new
-# canonical command tips past the cap, demote a rarer one-off lookup (version, whoami, diff, ...)
-# rather than a recurring interactive surface (context, loop, save, approvals). Keep TIGHT — the
-# parity test reads this set. Aliases are never pinned ahead of canonicals.
-_SLACK_VIA_HERMES_ONLY = frozenset({
-    "topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat",
-    "refine", "review", "pause", "whoami", "platform", "insights", "login"})
+# The commands that get one of the 24 native slots beside ``/hermes``, in order: interrupting and
+# steering a live run, answering approvals, and inspecting or switching session state. Everything
+# else stays reachable as ``/hermes <command>`` (``slack_subcommand_map``), and the handler still
+# answers it natively for apps that declared it before the cap. Unavailable entries (config-gated,
+# disabled) simply leave their slot empty.
+_SLACK_NATIVE_PRIORITY = (
+    "new", "stop", "retry", "undo", "rollback", "approve", "deny", "steer", "queue", "bg", "goal",
+    "plan", "model", "reasoning", "compress", "context", "usage", "resume", "sessions", "kanban",
+    "restart", "reload-mcp", "reload-skills", "help")
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -390,11 +392,9 @@ def _sanitize_slack_name(raw: str) -> str:
     return _SLACK_INVALID_CHARS.sub("", raw.lower()).strip("-_")[:_SLACK_NAME_LIMIT]
 
 
-def slack_native_slashes() -> list[tuple[str, str, str]]:
-    """(slash_name, description, usage_hint) triples for Slack: every gateway-available command
-    (canonical names first so they win slots at the cap, then aliases, then plugins) becomes a
-    standalone slash, deduped and clamped to the 50-command cap; Slack built-ins and
-    _SLACK_VIA_HERMES_ONLY are skipped. ``/hermes`` is always first for anything dropped."""
+def _slack_slash_entries() -> list[tuple[str, str, str]]:
+    """Every registerable Slack slash as ``(name, description, usage_hint)``: ``/hermes``, then
+    gateway-available canonicals, their aliases, then plugin commands; deduped, built-ins skipped."""
     available = _gateway_available_commands()
     wanted = [(cmd.name, cmd.description, cmd.args_hint or "") for cmd in available]
     wanted += [(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
@@ -406,14 +406,28 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     seen = {"hermes"}
     for name, desc, hint in wanted:
         slack_name = _sanitize_slack_name(name)
-        if (not slack_name or slack_name in seen or slack_name in _SLACK_RESERVED_COMMANDS
-                or slack_name in _SLACK_VIA_HERMES_ONLY
-                or len(entries) >= _SLACK_MAX_SLASH_COMMANDS):
+        if not slack_name or slack_name in seen or slack_name in _SLACK_RESERVED_COMMANDS:
             continue
         # Slack description cap is 2000 chars; keep it short.
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
     return entries
+
+
+def slack_native_slashes() -> list[tuple[str, str, str]]:
+    """(slash_name, description, usage_hint) triples for the generated Slack manifest: ``/hermes``
+    plus the available ``_SLACK_NATIVE_PRIORITY`` commands, within Slack's 25-command cap."""
+    by_name = {entry[0]: entry for entry in _slack_slash_entries()}
+    names = ["hermes", *(n for n in _SLACK_NATIVE_PRIORITY if n in by_name)]
+    return [by_name[name] for name in names[:_SLACK_MAX_SLASH_COMMANDS]]
+
+
+def slack_slash_command_pattern() -> re.Pattern[str]:
+    """The adapter's slash matcher: every registerable name, uncapped. An app may declare more than
+    the generated manifest (grandfathered pre-cap apps, hand-edited manifests); a command Slack
+    delivers must never go unanswered because it lost a manifest slot."""
+    names = [name for name, _desc, _hint in _slack_slash_entries()]
+    return re.compile(r"^/(?:" + "|".join(re.escape(n) for n in names) + r")$")
 
 
 def slack_app_manifest(

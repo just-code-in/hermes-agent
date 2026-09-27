@@ -5,7 +5,7 @@ from prompt_toolkit.document import Document
 
 from hermes_cli.commands import COMMAND_REGISTRY, COMMANDS_BY_CATEGORY, CommandDef, GATEWAY_KNOWN_COMMANDS, gateway_help_lines, infer_argument_mode, resolve_command
 from hermes_cli.commands_completion import SlashCommandAutoSuggest, SlashCommandCompleter
-from hermes_cli.commands_platforms import _CMD_NAME_LIMIT, _SLACK_RESERVED_COMMANDS, _SLACK_VIA_HERMES_ONLY, _clamp_command_names, _sanitize_telegram_name, slack_app_manifest, slack_native_slashes, slack_subcommand_map, telegram_bot_commands, telegram_menu_commands
+from hermes_cli.commands_platforms import _CMD_NAME_LIMIT, _SLACK_RESERVED_COMMANDS, _clamp_command_names, _sanitize_telegram_name, slack_app_manifest, slack_native_slashes, slack_subcommand_map, telegram_bot_commands, telegram_menu_commands
 
 
 def _completions(completer: SlashCommandCompleter, text: str):
@@ -164,34 +164,24 @@ class TestSlackNativeSlashes:
 
 
     def test_telegram_parity(self):
-        """Every Telegram bot command must be registerable on Slack too.
+        """Every Telegram bot command is reachable on Slack: a native slash in the generated
+        manifest, or ``/hermes <command>``. Slack built-ins can't be registered either way."""
+        reachable = {n for n, _d, _h in slack_native_slashes()} | set(slack_subcommand_map())
 
-        This catches the old behavior where Slack users couldn't invoke
-        commands like /btw natively. If a future command surfaces on
-        Telegram but not Slack (because of Slack's 50-slash cap), this
-        test fails loudly so we can curate the list rather than silently
-        dropping parity.
-
-        Slack-reserved built-in commands (e.g. /status) are excluded
-        from parity checks since they cannot be registered on Slack.
-        """
-        slack_names = {n for n, _d, _h in slack_native_slashes()}
-        tg_names = {n for n, _d in telegram_bot_commands()}
-        # Some Telegram names have underscores where Slack uses hyphens
-        # (e.g. set_home vs sethome). Normalize both sides for comparison.
         def _norm(s: str) -> str:
             return s.replace("-", "_").replace("__", "_").strip("_")
 
-        slack_norm = {_norm(n) for n in slack_names}
-        tg_norm = {_norm(n) for n in tg_names}
-        reserved_norm = {_norm(n) for n in _SLACK_RESERVED_COMMANDS}
-        # Commands deliberately routed through /hermes <command> on Slack only
-        # (Slack's 50-slash cap) are expected to be absent from native slashes.
-        via_hermes_norm = {_norm(n) for n in _SLACK_VIA_HERMES_ONLY}
-        missing = (tg_norm - slack_norm) - reserved_norm - via_hermes_norm
-        assert not missing, (
-            f"commands on Telegram but missing from Slack native slashes: {sorted(missing)}"
-        )
+        missing = ({_norm(n) for n, _d in telegram_bot_commands()}
+                   - {_norm(n) for n in reachable} - {_norm(n) for n in _SLACK_RESERVED_COMMANDS})
+        assert not missing, f"commands on Telegram but unreachable on Slack: {sorted(missing)}"
+
+    def test_manifest_fits_slacks_per_app_cap(self):
+        """Slack rejects an app declaring more than 25 slash commands, so a generated manifest
+        must stay installable however many commands the registry and plugins grow to.
+        Regression for #124762."""
+        slashes = [e["command"] for e in slack_app_manifest()["features"]["slash_commands"]]
+        assert "/hermes" in slashes
+        assert len(slashes) == len(set(slashes)) <= 25
 
 
 class TestSlackAppManifest:
