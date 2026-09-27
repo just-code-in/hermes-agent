@@ -111,16 +111,30 @@ Upstream already has a correct, profile-scoped container-to-host translator:
 - the credential-surface carve-out for `/root/.hermes/*`;
 - the #109024 profile-scope bug.
 
-`tools/` and `hermes_cli/` must not import `gateway/`. So the first commit is a
-mechanical extraction of those helpers into a lower module (proposed:
-`tools/environments/docker_paths.py`). It should return the mount **mode** too, so
-allocation can require a writable mount. `gateway/platforms/base.py` keeps its
-behaviour by calling the new module.
+`tools/` and `hermes_cli/` must not import `gateway/`, so the Kanban code can't call
+that translator where it lives.
+
+The lower-level module already exists on the fork: `tools/container_paths.py`
+(commit `2b45630cd`, "feat(tools): add container_paths helper to translate sandbox
+bind mounts"). It's the base commit of the filed context-cwd and skill-dir PRs
+(`fix/context-cwd-container-translation`, `fix/skill-dir-container-path`). It
+already reads through `tools.terminal_scope.terminal_env`, excludes read-only mounts
+in the container-to-host direction (`to_host_dir`, `container_mount_map`), and names
+the gateway translator as a follow-up to merge in. It does **not** yet know the
+synthetic persistent-sandbox mounts (`<sandbox>/docker/<candidate>/workspace` →
+`/workspace`, `.../home` → `/root`), which is the case a default-configured Docker
+profile hits.
+
+So step 3 is:
+1. Build on `tools/container_paths.py`, once it has landed or as a stacked commit.
+2. Move the persistent-sandbox and cache-dir mount helpers out of
+   `gateway/platforms/base.py` into it, keeping the `/root/.hermes/*` carve-out.
+3. Point `_translate_docker_container_media_path` at it, so there's one mount table
+   and not three.
 
 That commit has a test-seam risk. Media-translation tests may monkeypatch
 `gateway.platforms.base._tenv` and friends. Following "patch where production reads",
-the extraction PR re-points only the tests whose seam actually moved, and nothing
-else.
+the extraction re-points only the tests whose seam actually moved, and nothing else.
 
 `TERMINAL_DOCKER_VOLUMES` may reach the process as a list rendered to JSON, or as a
 JSON-encoded string that was passed straight through. `_parse_docker_volume_mounts`
@@ -182,15 +196,17 @@ Docker assignee.
 2. Retire `scripts/hermes-hook-kanban-artifact-host-path.py` (the `pre_tool_call`
    hook) once proof cards complete without it, and shrink the `kanban-worker-contract`
    plugin text.
-3. Reconcile with `container-path-translation.patch` / `tools/container_paths.py`
-   (below).
+3. Cut the local patch on top of `container-path-translation.patch`, which carries
+   `tools/container_paths.py`, so the two don't edit the same lines.
 
 ## Open questions (for Justin and the Mac session)
 
-1. **Overlap with upstream PR #124757.** It carries `tools/container_paths.py`
-   (`container-path-translation`), a tools-level translator. If it's still open, step 3
-   should build on that module rather than add a third translator, or the two PRs need
-   an agreed order. What's its state, and what exactly does the module export?
+1. **Order against the open container-path PRs.** PR #124757
+   (`fix/media-bare-path-container-translation`) extends the gateway's private
+   translator. The context-cwd and skill-dir PRs ship `tools/container_paths.py`. What
+   are those two PRs' upstream numbers and states? Step 3 should stack on whichever
+   lands `tools/container_paths.py`, and should wait for #124757 so the two don't
+   edit `gateway/platforms/base.py` against each other.
 2. **Existing upstream work.** Per the fleet rule, search upstream's open PRs and
    issues for Kanban + Docker/container scratch workspaces before anything is filed.
    If one exists, this note becomes a comment there, not a PR.
