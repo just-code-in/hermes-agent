@@ -1,224 +1,202 @@
 # Kanban scratch workspaces for Docker workers — design note (Option B)
 
-Status: **proposal, no code yet.** Written against upstream `main` at `6e69a8933`
-(2026-09-28). Line numbers refer to that commit.
+Status: **proposal for Justin's review. No code.** Written against upstream `main`
+`6e69a8933` (2026-09-28); line numbers refer to that commit. The reporting fleet runs
+`8c9fe964` plus 18 local patches. Revision 2 fits the design to three pieces already
+live on the fleet:
 
-## The bug
+- `container-path-translation.patch`, which carries `tools/container_paths.py`;
+- the fail-closed `pre_tool_call` hook `scripts/hermes-hook-kanban-artifact-host-path.py`;
+- the `kanban-worker-contract` plugin's `/workspace/kanban/$HERMES_KANBAN_TASK/`
+  convention.
 
-A Kanban worker whose profile runs its terminal in Docker never sees its scratch
-workspace, and its deliverables are silently dropped from the board.
+## The bug in four steps
 
-1. The dispatcher creates the scratch dir on the host, at
+1. **Allocation.** The dispatcher creates the scratch dir on the host, at
    `<kanban home>/boards/<board>/workspaces/<task-id>`
-   (`hermes_cli/kanban_db_workspace.py:583` `resolve_workspace`). It then pins
+   (`hermes_cli/kanban_db_workspace.py:583` `resolve_workspace`). It then pins both
    `HERMES_KANBAN_WORKSPACE` and `TERMINAL_CWD` to that host path
    (`hermes_cli/kanban_db_dispatch.py:2847`, `:2863`).
-2. The worker's terminal and file tools run inside the profile's container. That host
-   path is not mounted there, and `_resolve_config_cwd`
-   (`tools/terminal_tool.py:652`) discards it as an unusable container cwd. The work
-   lands wherever the backend's default cwd points, which is `/workspace` on the
-   reporting fleet.
-3. `kanban_complete` records the artifact as a container path (`/workspace/x.md`).
-   `_persist_scratch_completion_artifacts` (`hermes_cli/kanban_db.py:3009`) copies only
-   artifacts that resolve under the host scratch root. It skips this one without a
-   copy, an attachment row or an error, and completion then removes the empty scratch
-   dir. The board ends up pointing at a path nothing on the host can open.
-4. `KANBAN_GUIDANCE` (`agent/prompt_builder.py:269-319`) tells every worker to
-   `cd $HERMES_KANBAN_WORKSPACE`, which fails inside the container.
+2. **Execution.** The worker's terminal runs in the profile's long-lived container,
+   where that path doesn't exist. `_resolve_config_cwd` (`tools/terminal_tool.py:652`)
+   discards it, so `cd $HERMES_KANBAN_WORKSPACE` fails and output lands in `/workspace`.
+3. **Completion.** `kanban_complete(artifacts=["/workspace/x.md"])` records a container
+   path. `_persist_scratch_completion_artifacts` (`hermes_cli/kanban_db.py:3009`) copies
+   only paths under the host scratch root, so it skips this one silently. There's no
+   copy, no attachment and no error. Completion then removes the empty scratch dir.
+4. **Result.** The board points at a path nothing on the host can open.
 
-## Why not mount the scratch dir (Option A)
+Mounting each scratch dir into the container (Option A) is ruled out. Containers are
+reused across processes by label (`tools/environments/docker.py:668-686`), and mounts
+apply only when a container is created. Justin rejected recreating containers on
+2026-08-05.
 
-Containers are reused across processes. `DockerEnvironment` attaches to an existing
-container by label (`hermes-task-id`, `hermes-profile`, egress fingerprint;
-`tools/environments/docker.py:668-686`), and a Kanban worker attaches to its profile's
-long-lived container. Bind mounts are fixed when a container is created, so a
-per-task mount would mean recreating the shared container for every card. The
-reporting fleet rejected that on 2026-08-05: it costs a gateway restart plus
-`docker rm -f` on every container, and it adds a second output location that
-competes with `/workspace`.
+## Design: allocate inside a mount the container already has
 
-## Proposal
+The dispatcher still creates a real host dir, so the board, the DB and cleanup keep
+working on host paths. The change is **where**: inside the assignee's existing writable
+`/workspace` mount, at the plugin's existing spelling. The same directory has two names:
 
-**Put the scratch dir where the container can already see it, then translate paths
-at the two boundaries.**
+| Side | Path |
+| --- | --- |
+| host (DB `workspace_path`) | `<host dir behind /workspace>/kanban/<task-id>` |
+| container (worker env) | `/workspace/kanban/<task-id>` |
 
-This refines Option B as originally described ("stop creating a host scratch dir,
-translate completion paths back"). The dispatcher still creates a real host dir, so
-the board, the DB and cleanup keep working on host paths. It creates that dir inside
-a writable mount the assignee's container already has, and gives the worker the
-container spelling of it.
+On the fleet, "the host dir behind `/workspace`" is each profile's
+`…/sandboxes/docker/default/workspace`, which every profile mounts read-write.
 
-### 1. Allocation (dispatcher, host side)
+### Dispatcher changes
 
-In `_dispatch_lane_task` (`hermes_cli/kanban_db_dispatch.py:2016`) / `resolve_workspace`, for a `scratch` task whose **assignee**
-profile resolves to the Docker backend with persistent containers:
+In `_dispatch_lane_task` (`hermes_cli/kanban_db_dispatch.py:2016`), before
+`resolve_workspace` runs for a `scratch` task with no explicit `workspace_path`:
 
-- Resolve the assignee's mount table inside `_worker_profile_scope(profile_home)`
-  (`hermes_cli/kanban_db_dispatch.py:2600`), so the `TERMINAL_*` values and the
-  sandbox layout are the assignee's and not the dispatching gateway's.
-- Find the host dir backing container `/workspace`, using the same order the media
-  translator uses:
-  - an explicit **writable** `docker_volumes` entry targeting `/workspace`;
-  - otherwise the persistent sandbox layout
-    (`<sandbox>/docker/<candidate>/workspace`).
+1. Enter `_worker_profile_scope(profile_home)` (`:2600`), the scope toolset resolution
+   already uses. Inside it, `tools.container_paths` reads the **assignee's**
+   `TERMINAL_ENV` / `TERMINAL_DOCKER_VOLUMES` and not the dispatching gateway's.
+2. `host_root = container_paths.to_host_dir("/workspace")`. This returns a writable
+   mount only; read-only mounts are excluded, and a non-Docker backend returns `None`.
+3. If `host_root` is set, allocate `host_root/kanban/<task-id>`, **refusing a dir that
+   already exists**. Task ids are 32 random bits per board
+   (`hermes_cli/kanban_db.py:1086`), so two boards can collide in one profile's
+   sandbox; a refusal falls back to step 5 with a warning.
+4. Record the host path as `workspace_path`. Build the worker env with
+   `HERMES_KANBAN_WORKSPACE` and `TERMINAL_CWD` set to
+   `container_paths.to_container_path(host_path)`, which is `/workspace/kanban/<task-id>`.
+   The existing `os.path.isdir(workspace)` guard at `:2862` must test the **host** path
+   before `TERMINAL_CWD` gets the container spelling.
+5. **Fallback, which is today's behaviour byte for byte:** a non-Docker backend, no
+   writable `/workspace` mount, or an allocation refusal.
 
-  Only an **existing** dir counts; if the container was never created, fall through.
-- Allocate `<that host dir>/kanban/<board>/<task-id>` on the host. The container sees
-  the same dir as `/workspace/kanban/<board>/<task-id>`.
-- `workspace_path` in the DB is the **host** path. The worker gets the **container**
-  path in `HERMES_KANBAN_WORKSPACE` and `TERMINAL_CWD`. `_is_unusable_container_cwd`
-  accepts it, since it's absolute and not a host prefix, so the worker's shell and
-  file tools start in the right place and `cd $HERMES_KANBAN_WORKSPACE` works.
-- **Fallback:** keep today's behaviour exactly when any of these holds:
-  - the backend isn't Docker, or containers aren't persistent;
-  - `/workspace` is `:ro` or tmpfs, or `docker_mount_cwd_to_workspace` is on (the
-    host root then depends on whichever process created the container, which the
-    dispatcher can't know);
-  - no backing dir exists yet.
+`worktree` and `dir` workspaces are never relocated. They're user-owned paths.
 
-  The `<board>` segment keeps two boards' same-named tasks apart, and keeps one board's
-  cleanup inside its own subtree.
-
-### 2. Completion (worker process, host side)
+### Completion changes
 
 `kanban_complete` and `kanban_request_review` run in the worker process on the host,
-with the assignee's `TERMINAL_*` env already bound. In
-`tools/kanban_tools.py::_handle_complete` / `_handle_request_review`, before
-`complete_task`:
+with the assignee's terminal env already bound. In `tools/kanban_tools.py`, in
+`_handle_complete` (`:690`) and `_handle_request_review` (`:828`), right after the
+artifacts are coerced and **before** `complete_task` or any containment check, each
+artifact is translated by its prefix:
 
-- Translate every container-absolute artifact path to its host path through the
-  shared mount table (step 3). A path under the task's workspace then resolves under
-  the host `workspace_path`, and `_persist_scratch_completion_artifacts` copies it to
-  attachments as designed. A path elsewhere under a mount (e.g. `/workspace/reports/x.md`)
-  is recorded by its host path, which is strictly better than a container path the host
-  can't open.
-- An untranslatable path stays as given (today's tolerance for artifacts referenced
-  only by name).
-- Translation happens **before** the existing containment, size and regular-file
-  checks, so a container path gets exactly the verdict its host path would. This is
-  the same ordering rule the media translator follows.
+| Declared artifact | Result |
+| --- | --- |
+| Under a **writable** mount, host file exists | Replaced by its host path; a scratch artifact then gets copied to attachments by the existing pipeline |
+| Under a writable mount, host file **missing** | **Rejected**: `ArtifactPreservationError`, task stays in flight, scratch kept, same tool error as today |
+| Outside every writable mount (host path, name, `/tmp/x` in the container) | Unchanged: upstream's "referenced by name only" tolerance |
 
-### 3. One mount table (a refactor that has to come first)
+That's the hook's rule set, so the hook retires (below).
 
-Upstream already has a correct, profile-scoped container-to-host translator:
-`gateway/platforms/base.py:1066` `_translate_docker_container_media_path`, with
-`_parse_docker_volume_mounts` (`:941`), `_docker_persistent_sandbox_roots` (`:1011`),
-`_default_docker_workspace_host_roots` (`:1025`) and `_cache_dir_container_mounts`
-(`:1040`). It already handles:
+The translation needs one new function in `tools/container_paths.py`:
+`to_host_path(declared) -> str | None`, the file-or-dir sibling of `to_host_dir`. It
+maps textually through `container_mount_map()` (writable only, longest prefix first),
+after `posixpath.normpath`. It then refuses any result whose resolved path leaves the
+mount's host root, so `..` and symlink escapes don't turn into host reads. The
+existence check stays in the caller, so "missing" can be a rejection and not a silent
+`None`.
 
-- longest-prefix matching;
-- the synthetic persistent `/workspace` and `/root` mounts;
-- the credential-surface carve-out for `/root/.hermes/*`;
-- the #109024 profile-scope bug.
+### Cleanup changes
 
-`tools/` and `hermes_cli/` must not import `gateway/`, so the Kanban code can't call
-that translator where it lives.
+`_managed_scratch_path_info` (`hermes_cli/kanban_db_workspace.py:72`) gates both the
+artifact copy and the completion `rmtree`, so it's the security-sensitive edit. A
+relocated scratch dir counts as managed only if all three hold:
 
-The lower-level module already exists on the fork: `tools/container_paths.py`
-(commit `2b45630cd`, "feat(tools): add container_paths helper to translate sandbox
-bind mounts"). It's the base commit of the filed context-cwd and skill-dir PRs
-(`fix/context-cwd-container-translation`, `fix/skill-dir-container-path`). It
-already reads through `tools.terminal_scope.terminal_env`, excludes read-only mounts
-in the container-to-host direction (`to_host_dir`, `container_mount_map`), and names
-the gateway translator as a follow-up to merge in. It does **not** yet know the
-synthetic persistent-sandbox mounts (`<sandbox>/docker/<candidate>/workspace` →
-`/workspace`, `.../home` → `/root`), which is the case a default-configured Docker
-profile hits.
+- it is exactly `<writable /workspace host root>/kanban/<task-id>`, checked both
+  resolved and lexically, like the existing roots;
+- its task-id component equals the task's own id;
+- it equals the DB `workspace_path`.
 
-So step 3 is:
-1. Build on `tools/container_paths.py`, once it has landed or as a stacked commit.
-2. Move the persistent-sandbox and cache-dir mount helpers out of
-   `gateway/platforms/base.py` into it, keeping the `/root/.hermes/*` carve-out.
-3. Point `_translate_docker_container_media_path` at it, so there's one mount table
-   and not three.
+A card whose `workspace_path` was hand-set to anything else under the sandbox is never
+removed. `/workspace` and `/workspace/kanban` themselves are never managed.
 
-That commit has a test-seam risk. Media-translation tests may monkeypatch
-`gateway.platforms.base._tenv` and friends. Following "patch where production reads",
-the extraction re-points only the tests whose seam actually moved, and nothing else.
+### `KANBAN_GUIDANCE` changes: none
 
-`TERMINAL_DOCKER_VOLUMES` may reach the process as a list rendered to JSON, or as a
-JSON-encoded string that was passed straight through. `_parse_docker_volume_mounts`
-already calls `json.loads` on the raw env value, so both spellings parse; a test should
-pin that.
+With the container spelling in `$HERMES_KANBAN_WORKSPACE`, the existing text
+(`agent/prompt_builder.py:269-330`) is accurate as written: "`cd $HERMES_KANBAN_WORKSPACE`
+first" works, and "Files must exist at completion" is now enforced for container paths
+too. Leaving it byte-identical also avoids churning a system-prompt constant.
 
-### 4. Cleanup
+### How `docker_volumes` is read
 
-`_managed_scratch_path_info` (`hermes_cli/kanban_db_workspace.py:72`) gates **both**
-the artifact copy and the completion `rmtree`. It must learn the new root, but this is
-the security-sensitive part of the change:
+Both spellings already parse:
 
-- The new managed root is exactly `<backing /workspace dir>/kanban/<board>/`,
-  recognised both resolved and lexically, like the existing roots. It never covers
-  `/workspace` itself or anything above `kanban/`.
-- A path is managed only if the dispatcher allocated it: the DB's `workspace_path`
-  equals the path, and its last component is the task id. A card whose
-  `workspace_path` was set by hand to something under the sandbox must not become
-  `rmtree`-able.
+- a YAML list is rendered with `json.dumps` by the env bridge (`gateway/run.py:2029`)
+  and by `_config_terminal_value`;
+- a JSON-encoded string passes through unchanged.
 
-### 5. Guidance text
+`_volume_specs` then calls `json.loads`, and both give a list. A test pins both forms.
+A plain non-JSON string, such as a single bare `a:b`, still yields no mounts. That's
+today's behaviour, and the fleet no longer uses it.
 
-`KANBAN_GUIDANCE` doesn't change. `cd $HERMES_KANBAN_WORKSPACE` is simply true now.
-The reporting fleet's `kanban-worker-contract` plugin can drop its "what a failed
-`cd` means" paragraph.
+## What it retires on the fleet
+
+| Piece | Fate | Why |
+| --- | --- | --- |
+| `scripts/hermes-hook-kanban-artifact-host-path.py` (`pre_tool_call`, fail-closed) | Retire after proof cards pass without it | Its reverse mapping and its reject-if-missing rule move into `kanban_complete` itself |
+| `kanban-worker-contract` plugin | Retire, or keep only non-workspace prose | Its job is explaining a failed `cd` and pointing at `/workspace/kanban/$HERMES_KANBAN_TASK/`; the env var now **is** that path |
+| `container-path-translation.patch` | Stays, gains `to_host_path` | It's the dependency; it shrinks when its upstream PR lands |
+| `logs/kanban-artifact-hook.jsonl` | Stops growing | The tool error and the task's event log carry rejections |
+
+Retire the hook and plugin one at a time, each after a proof card, never in the same
+step as deploying the fix.
 
 ## Non-goals
 
-- Other container backends (Modal, Daytona, Singularity, SSH, Vercel sandbox) keep
-  today's behaviour. Their mount models differ, and none has a reported incident.
-- `worktree` and `dir` workspaces are untouched: they're user-owned paths, never
-  relocated and never removed.
-- No change to how containers are created, labelled or reused.
+- Upstream's default Docker layout, where no `docker_volumes` entry claims `/workspace`
+  and the persistent sandbox is bound implicitly. Covering it means teaching
+  `container_paths` the synthetic mounts that
+  `gateway/platforms/base.py:1011-1040` computes for media delivery. That's worth doing
+  before an upstream PR, but it isn't needed on the fleet, where every profile mounts
+  `/workspace` explicitly.
+- Other container backends (Modal, Daytona, Singularity, SSH, Vercel sandbox).
+- Any change to how containers are created, labelled or reused.
 
-## Tests (behaviour contracts, each shown red on base)
+## Tests: red on base, green with the fix
 
-1. **Allocation relation.** For a Docker-persistent assignee (temp `HERMES_HOME`,
-   sandbox `workspace` dir present), the worker env's `HERMES_KANBAN_WORKSPACE`,
-   translated container-to-host through the assignee's mount table, equals the task's
-   `workspace_path`, and that dir exists on the host. Run it A→B→A across two profile
-   homes under multiplex, so the dispatcher's own profile never leaks into the
-   assignee's table.
-2. **Preservation.** A worker completes with `artifacts=["/workspace/kanban/<board>/<id>/report.md"]`.
-   The file is copied into the task's attachments, and the recorded artifact is the
-   attachment path. On base it's skipped silently.
-3. **Fallback.** With a non-Docker backend, or a `:ro` `/workspace`, allocation and env
-   are byte-identical to base. This guards the "no behaviour change elsewhere" promise.
-4. **Cleanup boundary.** A scratch card whose `workspace_path` was set by hand under the
-   sandbox `workspace` dir is never removed on completion.
+Behaviour contracts with real imports against temp homes, and no Docker daemon, since
+the mapping is filesystem layout.
 
-No real Docker daemon is needed. The mapping is pure filesystem layout with real
-imports. The live proof is a card on the reporting fleet's `experiments` board with a
-Docker assignee.
+1. **Allocation relation, A→B→A under multiplex.** Profile B has Docker and a writable
+   `<tmp>/b-ws:/workspace` volume; profile A is local. Dispatch B's card, then A's,
+   then B's again. For each B card, `to_host_path(env["HERMES_KANBAN_WORKSPACE"])`
+   under B's scope equals the task's `workspace_path`, and that dir exists. A's env is
+   identical to base.
+   *Red on base:* B's env carries the host path, which B's container can't open.
+2. **Completion translation**, parametrized over the three table rows above:
+   - `/workspace/kanban/<id>/report.md` existing → the recorded artifact is an
+     attachment path, and the file was copied. *Red on base:* skipped silently.
+   - `/workspace/kanban/<id>/missing.md` → `ArtifactPreservationError`, and the task
+     is still running. *Red on base:* accepted.
+   - `notes.md` → recorded unchanged. Green on both, as a guard.
+3. **Cleanup boundary.** A scratch card whose `workspace_path` was hand-set to
+   `<b-ws>/kanban/other-dir` is never removed on completion. Green on base too (base
+   never manages that root); it guards the new managed-root rule.
 
-## Rollout on the reporting fleet (Mac)
+Plus one line in `tests/tools/test_container_paths.py` that feeds `docker_volumes` as
+a YAML list and as a JSON-encoded string and gets the same mount map.
 
-1. Land the extraction (step 3) and the fix as separate commits on
-   `fix/kanban-container-scratch-workspace`; cut local patches against the live base.
-2. Retire `scripts/hermes-hook-kanban-artifact-host-path.py` (the `pre_tool_call`
-   hook) once proof cards complete without it, and shrink the `kanban-worker-contract`
-   plugin text.
-3. Cut the local patch on top of `container-path-translation.patch`, which carries
-   `tools/container_paths.py`, so the two don't edit the same lines.
+**Live proof on the fleet:** a card on `experiments` assigned to a Docker profile. The
+worker's first `pwd` is `/workspace/kanban/<id>`, the report shows up as a card
+attachment, and `kanban-artifact-hook.jsonl` records nothing, because the hook has been
+disabled for that proof.
 
-## Open questions (for Justin and the Mac session)
+## Delivery
 
-1. **Order against the open container-path PRs.** PR #124757
-   (`fix/media-bare-path-container-translation`) extends the gateway's private
-   translator. The context-cwd and skill-dir PRs ship `tools/container_paths.py`. What
-   are those two PRs' upstream numbers and states? Step 3 should stack on whichever
-   lands `tools/container_paths.py`, and should wait for #124757 so the two don't
-   edit `gateway/platforms/base.py` against each other.
-2. **Existing upstream work.** Per the fleet rule, search upstream's open PRs and
-   issues for Kanban + Docker/container scratch workspaces before anything is filed.
-   If one exists, this note becomes a comment there, not a PR.
-3. **Observed worker cwd.** The code says a discarded host `TERMINAL_CWD` falls back to
-   the Docker default (`/root`, `tools/terminal_tool.py:649`), yet the fleet reports
-   files landing in `/workspace`. Does the worker process re-bridge `terminal.cwd` from
-   `config.yaml`? Check one live worker's first `pwd` and say which it is. It doesn't
-   change the design, but it does change the "before" in the test.
-4. **Path convention.** The plugin and hook use `/workspace/kanban/<task-id>`. This
-   note proposes `/workspace/kanban/<board>/<task-id>`. Is the extra segment OK for the
-   fleet's tooling?
-5. **What survives completion.** Today the scratch dir is removed after declared
-   artifacts are copied. With the dir inside `/workspace`, is removing undeclared files
-   still what you want, or should Docker scratch dirs be kept (like `worktree`) and
-   pruned later?
+- Branch `fix/kanban-container-scratch-workspace`, stacked on the fork commit that adds
+  `tools/container_paths.py` (`2b45630cd`).
+- Three commits: `to_host_path` + parse test; dispatcher + cleanup; completion.
+- Local patch cut against `8c9fe964` on top of `container-path-translation.patch`, with
+  `check-patches.sh` green.
+- Upstream: nothing is filed until Justin approves, and only after a search of open
+  PRs and issues on Kanban + Docker/container scratch workspaces. If one exists, this
+  becomes a comment there.
+
+## Questions for Justin
+
+1. **Remove undeclared files on completion?** Today the scratch dir is removed after
+   declared artifacts are copied. It now lives inside the profile's `/workspace`, so a
+   worker's other output (logs, intermediate data) disappears with it, as it does
+   today. Keep that, or keep Docker scratch dirs like `worktree` and prune them later?
+2. **Plugin retirement.** Does `kanban-worker-contract` carry anything besides the
+   workspace explanation? If so, it shrinks rather than retires.
+3. **Upstream order.** Which upstream PR carries `tools/container_paths.py`, and is it
+   still open? Fix 5 can't be proposed upstream before it lands, or it has to be
+   stacked on it.
